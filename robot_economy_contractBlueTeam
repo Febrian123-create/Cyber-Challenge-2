@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+from threading import RLock
+
+
+class RobotEconomyContract:
+
+    def __init__(self, admin_address):
+        accounts = {"alice": 1000, "bob": 500, "robot_01": 0, "robot_02": 0}
+        if not self._valid_address(admin_address) or admin_address in accounts:
+            raise ValueError("Admin must have a valid, distinct address")
+        self._lock = RLock()
+        self._admin = admin_address
+        self._balances = {**accounts, admin_address: 0}
+        self._emergency_funds = 10000
+        self._robots = frozenset(("robot_01", "robot_02"))
+        self._reserved = {robot: 0 for robot in self._robots}
+        self._deliveries = {}
+        self._is_paused = False
+        self._events = []
+        self._log("contract_initialized", admin_address, emergency_funds=10000)
+
+    @staticmethod
+    def _valid_address(address):
+        return type(address) is str and bool(address) and address.strip() == address
+
+    @staticmethod
+    def _valid_amount(amount):
+        return type(amount) is int and amount > 0
+
+    def _known_caller(self, caller):
+        return self._valid_address(caller) and caller in self._balances
+
+    def _is_admin(self, caller):
+        return self._valid_address(caller) and caller == self._admin
+
+    def _log(self, event, caller, **details):
+        self._events.append({
+            "sequence": len(self._events) + 1,
+            "event": event,
+            "caller": caller if type(caller) is str else None,
+            **details,
+        })
+
+    def _reject(self, action, caller, reason):
+        self._log("operation_rejected", caller, action=action, reason=reason)
+        return "error"
+
+    def _delivery(self, delivery_id):
+        if type(delivery_id) is not int or delivery_id <= 0:
+            return None
+        return self._deliveries.get(delivery_id)
+
+    @property
+    def admin(self):
+        return self._admin
+
+    @property
+    def balances(self):
+        with self._lock:
+            return self._balances.copy()
+
+    @property
+    def deliveries(self):
+        with self._lock:
+            return [delivery.copy() for delivery in self._deliveries.values()]
+
+    @property
+    def events(self):
+        with self._lock:
+            return [event.copy() for event in self._events]
+
+    @property
+    def is_paused(self):
+        with self._lock:
+            return self._is_paused
+
+    @property
+    def emergency_funds(self):
+        with self._lock:
+            return self._emergency_funds
+
+    def pay_robot(self, caller, robot, amount):
+        with self._lock:
+            if self._is_paused:
+                return self._reject("pay_robot", caller, "Contract is paused")
+            if not self._known_caller(caller):
+                return self._reject("pay_robot", caller, "Unknown caller")
+            if not self._valid_address(robot) or robot not in self._robots or robot == caller:
+                return self._reject("pay_robot", caller, "Invalid robot")
+            if not self._valid_amount(amount):
+                return self._reject("pay_robot", caller, "Invalid amount")
+            available = self._balances[caller] - self._reserved.get(caller, 0)
+            if amount > available:
+                return self._reject("pay_robot", caller, "Insufficient available funds")
+
+            delivery_id = len(self._deliveries) + 1
+            self._balances[caller] -= amount
+            self._balances[robot] += amount
+            self._reserved[robot] += amount
+            self._deliveries[delivery_id] = {
+                "id": delivery_id, "payer": caller, "robot": robot,
+                "amount": amount, "status": "pending",
+            }
+            self._log("payment", caller, robot=robot, amount=amount, delivery_id=delivery_id)
+            return {
+                "status": "success", "message": f"{amount} tokens sent to {robot}",
+                "delivery_id": delivery_id,
+            }
+
+    def settle_delivery(self, caller, delivery_id, status):
+        """An authenticated admin records the verified delivery outcome once."""
+        with self._lock:
+            if not self._is_admin(caller):
+                return self._reject("settle_delivery", caller, "Admin required")
+            delivery = self._delivery(delivery_id)
+            if delivery is None or delivery["status"] != "pending":
+                return self._reject("settle_delivery", caller, "Invalid or settled delivery")
+            if type(status) is not str or status not in ("failed", "completed"):
+                return self._reject("settle_delivery", caller, "Invalid outcome")
+            if status == "completed":
+                self._reserved[delivery["robot"]] -= delivery["amount"]
+            delivery["status"] = status
+            self._log("delivery_settled", caller, delivery_id=delivery_id, status=status)
+            return {"status": "success", "message": "Delivery outcome recorded"}
+
+    def request_refund(self, caller, delivery_id, amount):
+        with self._lock:
+            if not self._known_caller(caller):
+                return self._reject("request_refund", caller, "Unknown caller")
+            if not self._valid_amount(amount):
+                return self._reject("request_refund", caller, "Invalid amount")
+            delivery = self._delivery(delivery_id)
+            if delivery is None or delivery["payer"] != caller:
+                return self._reject("request_refund", caller, "Delivery does not belong to caller")
+            if delivery["status"] != "failed" or amount != delivery["amount"]:
+                return self._reject("request_refund", caller, "Delivery is not refundable for this amount")
+
+            robot = delivery["robot"]
+            delivery["status"] = "refunded"
+            self._reserved[robot] -= amount
+            self._balances[robot] -= amount
+            self._balances[caller] += amount
+            self._log("refund", caller, delivery_id=delivery_id, robot=robot, amount=amount)
+            return {"status": "success", "message": "Refund processed"}
+
+    def pause_contract(self, caller):
+        with self._lock:
+            if not self._is_admin(caller):
+                return self._reject("pause_contract", caller, "Admin required")
+            if self._is_paused:
+                return self._reject("pause_contract", caller, "Contract is already paused")
+            self._is_paused = True
+            self._log("contract_paused", caller)
+            return "Contract paused by emergency admin"
+
+    def resume_contract(self, caller):
+        with self._lock:
+            if not self._is_admin(caller):
+                return self._reject("resume_contract", caller, "Admin required")
+            if not self._is_paused:
+                return self._reject("resume_contract", caller, "Contract is not paused")
+            self._is_paused = False
+            self._log("contract_resumed", caller)
+            return "Contract resumed by admin"
+
+    def withdraw_emergency_funds(self, caller, amount):
+        with self._lock:
+            if not self._is_admin(caller):
+                return self._reject("withdraw_emergency_funds", caller, "Admin required")
+            if not self._is_paused:
+                return self._reject("withdraw_emergency_funds", caller, "Pause required")
+            if not self._valid_amount(amount) or amount > self._emergency_funds:
+                return self._reject("withdraw_emergency_funds", caller, "Invalid amount or insufficient treasury funds")
+            self._emergency_funds -= amount
+            self._balances[caller] += amount
+            self._log("emergency_withdrawal", caller, amount=amount)
+            return "Emergency funds withdrawn"
